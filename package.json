@@ -1,0 +1,18 @@
+{
+  "name": "skyup-leads-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mongodb": "^6.12.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
