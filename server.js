@@ -160,7 +160,9 @@ function notifyTelegramGoogle(lead) {
 
 function forwardToCrm(lead) {
   if (!process.env.CRM_WEBHOOK_URL) return
-  fetch(process.env.CRM_WEBHOOK_URL, {
+  const url = new URL(process.env.CRM_WEBHOOK_URL)
+  if (process.env.GOOGLE_WEBHOOK_KEY) url.searchParams.set('google_key', process.env.GOOGLE_WEBHOOK_KEY)
+  fetch(url.toString(), {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
