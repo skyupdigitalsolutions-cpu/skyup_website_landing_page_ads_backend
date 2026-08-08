@@ -34,8 +34,9 @@ async function leads() {
 
 const clean = (v, max = 200) => (typeof v === 'string' ? v.trim().slice(0, max) : '')
 
-// health check
+// health check — Railway pings this to confirm the container is alive
 app.get('/', (req, res) => res.json({ ok: true, service: 'skyup-leads-backend' }))
+app.get('/health', (req, res) => res.json({ ok: true }))
 
 // --- Capture a lead ---
 app.post('/api/lead', async (req, res) => {
@@ -104,8 +105,7 @@ app.get('/api/leads', async (req, res) => {
 function forwardToCrm(lead) {
   if (!process.env.CRM_WEBHOOK_URL) return
 
-  // Build the final URL — append GOOGLE_WEBHOOK_KEY as ?google_key=... if provided
-  // This lets you store the base URL and key as separate Railway variables
+  // Append GOOGLE_WEBHOOK_KEY as ?google_key=... so the CRM can match the campaign config
   let url = process.env.CRM_WEBHOOK_URL
   const key = process.env.GOOGLE_WEBHOOK_KEY
   if (key) {
@@ -143,4 +143,7 @@ function notifyTelegram(lead) {
   }).catch(() => {})
 }
 
-app.listen(PORT, () => console.log(`skyup-leads-backend running on :${PORT}`))
+// Bind to 0.0.0.0 so Railway's health check can reach the container externally.
+// Without this Node.js defaults to 127.0.0.1 (localhost only) and Railway
+// sees the port as unreachable → sends SIGTERM → restart loop.
+app.listen(PORT, '0.0.0.0', () => console.log(`skyup-leads-backend running on :${PORT}`))
