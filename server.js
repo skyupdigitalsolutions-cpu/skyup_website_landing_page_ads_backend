@@ -27,6 +27,9 @@ async function leads() {
   await client.connect()
   const coll = client.db(DB_NAME).collection(COLL)
   coll.createIndex({ createdAt: -1 }).catch(() => {})
+  // Unique index on phone — prevents duplicate leads at the DB level
+  // and makes the dedup query below fast.
+  coll.createIndex({ phone: 1 }, { unique: true, sparse: true }).catch(() => {})
   leadsColl = coll
   console.log(`Mongo connected → ${DB_NAME}.${COLL}`)
   return leadsColl
@@ -57,7 +60,22 @@ app.post('/api/lead', async (req, res) => {
 
   try {
     const coll = await leads()
-    await coll.insertOne(lead)
+    // Atomic upsert — if this phone already exists, $setOnInsert is a no-op
+    // and upserted will be null, meaning it's a duplicate submission.
+    const result = await coll.findOneAndUpdate(
+      { phone: lead.phone },
+      { $setOnInsert: lead },
+      { upsert: true, returnDocument: 'after' }
+    )
+    const wasInserted = !!result.lastErrorObject?.upserted
+    if (!wasInserted) {
+      // Phone already in DB — duplicate form submission (double-click, retry, etc.)
+      console.log(`[dedup] phone ${lead.phone} already exists — skipping CRM forward`)
+      return res.json({ ok: true })
+    }
+    // Assign the real MongoDB _id back onto lead so forwardToCrm sends it.
+    // CRM googleWebhookController reads body._id as a dedup key.
+    lead._id = result.value._id
   } catch (e) {
     console.error('db_error:', e.message)
     return res.status(500).json({ ok: false, error: 'db_error' })
@@ -85,84 +103,9 @@ app.get('/api/leads', async (req, res) => {
   res.json({ ok: true, count: rows.length, leads: rows })
 })
 
-// --- Google Ads Lead Form webhook ---
-// In Google Ads: Lead Form → Lead delivery → Webhook
-//   URL  → https://YOUR-BACKEND.up.railway.app/google-webhook
-//   Key  → value of GOOGLE_WEBHOOK_KEY env var (any secret string you choose)
-app.post('/google-webhook', async (req, res) => {
-  const key = process.env.GOOGLE_WEBHOOK_KEY
-  if (key && req.query.key !== key && req.headers['x-goog-webhook-key'] !== key) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' })
-  }
-
-  // Google sends an array of lead_data objects; handle both single and batch
-  const raw = req.body || {}
-  const items = Array.isArray(raw) ? raw : [raw]
-
-  for (const item of items) {
-    // Google Ads payload shape:
-    // { lead_id, campaign_id, campaign_name, ad_group_id, form_id,
-    //   column_data: [{ column_id, string_value }], ... }
-    const cols = {}
-    for (const c of (item.column_data || [])) {
-      cols[c.column_id] = c.string_value || ''
-    }
-
-    const lead = {
-      name:       clean(cols['FULL_NAME'] || cols['FIRST_NAME'] || '', 120),
-      business:   clean(cols['COMPANY_NAME'] || cols['BUSINESS_NAME'] || '', 160),
-      phone:      clean(cols['PHONE_NUMBER'] || '', 40),
-      email:      clean(cols['EMAIL'] || '', 160),
-      budget:     clean(cols['BUDGET'] || '', 60),
-      timeline:   clean(cols['TIMELINE'] || '', 60),
-      source:     'google-ads',
-      googleLeadId:   item.lead_id    || '',
-      campaignId:     item.campaign_id ? String(item.campaign_id) : '',
-      campaignName:   item.campaign_name || '',
-      formId:         item.form_id    ? String(item.form_id) : '',
-      rawCols:        cols,
-      createdAt:  new Date(),
-      ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || '',
-    }
-
-    try {
-      const coll = await leads()
-      await coll.insertOne(lead)
-    } catch (e) {
-      console.error('google_webhook db_error:', e.message)
-      // still return 200 so Google doesn't retry infinitely
-    }
-
-    notifyTelegramGoogle(lead)
-    forwardToCrm(lead)
-  }
-
-  res.json({ ok: true })
-})
-
-function notifyTelegramGoogle(lead) {
-  const token = process.env.TELEGRAM_BOT_TOKEN
-  const chat = process.env.TELEGRAM_CHAT_ID
-  if (!token || !chat) return
-  const text =
-    `🟢 New Google Ads lead\n` +
-    `Name: ${lead.name || '—'}\n` +
-    `Business: ${lead.business || '—'}\n` +
-    `Phone: ${lead.phone || '—'}\n` +
-    `Email: ${lead.email || '—'}\n` +
-    `Campaign: ${lead.campaignName || lead.campaignId || '—'}`
-  fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: chat, text }),
-  }).catch(() => {})
-}
-
 function forwardToCrm(lead) {
   if (!process.env.CRM_WEBHOOK_URL) return
-  const url = new URL(process.env.CRM_WEBHOOK_URL)
-  if (process.env.GOOGLE_WEBHOOK_KEY) url.searchParams.set('google_key', process.env.GOOGLE_WEBHOOK_KEY)
-  fetch(url.toString(), {
+  fetch(process.env.CRM_WEBHOOK_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
