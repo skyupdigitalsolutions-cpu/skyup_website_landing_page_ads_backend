@@ -27,8 +27,7 @@ async function leads() {
   await client.connect()
   const coll = client.db(DB_NAME).collection(COLL)
   coll.createIndex({ createdAt: -1 }).catch(() => {})
-  // Unique index on phone — prevents duplicate leads at the DB level
-  // and makes the dedup query below fast.
+  // Unique sparse index on phone — DB-level guard against duplicate submissions
   coll.createIndex({ phone: 1 }, { unique: true, sparse: true }).catch(() => {})
   leadsColl = coll
   console.log(`Mongo connected → ${DB_NAME}.${COLL}`)
@@ -60,23 +59,21 @@ app.post('/api/lead', async (req, res) => {
 
   try {
     const coll = await leads()
-    // Atomic upsert — if this phone already exists, $setOnInsert is a no-op
-    // and upserted will be null, meaning it's a duplicate submission.
-    const result = await coll.findOneAndUpdate(
-      { phone: lead.phone },
-      { $setOnInsert: lead },
-      { upsert: true, returnDocument: 'after' }
-    )
-    const wasInserted = !!result.lastErrorObject?.upserted
-    if (!wasInserted) {
-      // Phone already in DB — duplicate form submission (double-click, retry, etc.)
+
+    // Dedup: check if this phone was already submitted before inserting
+    const existing = await coll.findOne({ phone: lead.phone }, { projection: { _id: 1 } })
+    if (existing) {
       console.log(`[dedup] phone ${lead.phone} already exists — skipping CRM forward`)
       return res.json({ ok: true })
     }
-    // Assign the real MongoDB _id back onto lead so forwardToCrm sends it.
-    // CRM googleWebhookController reads body._id as a dedup key.
-    lead._id = result.value._id
+
+    await coll.insertOne(lead)
   } catch (e) {
+    // E11000 = unique index violation (two truly simultaneous submissions of same phone)
+    if (e.code === 11000) {
+      console.log(`[dedup] race-condition duplicate for ${lead.phone} — skipping`)
+      return res.json({ ok: true })
+    }
     console.error('db_error:', e.message)
     return res.status(500).json({ ok: false, error: 'db_error' })
   }
