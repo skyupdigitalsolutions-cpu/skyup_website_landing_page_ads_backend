@@ -27,8 +27,6 @@ async function leads() {
   await client.connect()
   const coll = client.db(DB_NAME).collection(COLL)
   coll.createIndex({ createdAt: -1 }).catch(() => {})
-  // Unique sparse index on phone — DB-level guard against duplicate submissions
-  coll.createIndex({ phone: 1 }, { unique: true, sparse: true }).catch(() => {})
   leadsColl = coll
   console.log(`Mongo connected → ${DB_NAME}.${COLL}`)
   return leadsColl
@@ -57,23 +55,26 @@ app.post('/api/lead', async (req, res) => {
   }
   if (!lead.name || !lead.phone) return res.status(400).json({ ok: false, error: 'missing_fields' })
 
+  // Dedup window: only block re-submission of the same phone within 10 minutes.
+  // This stops double-clicks and retries without permanently blocking a real
+  // returning visitor who fills the form again months later.
+  const TEN_MINUTES_AGO = new Date(Date.now() - 10 * 60 * 1000)
+
   try {
     const coll = await leads()
 
-    // Dedup: check if this phone was already submitted before inserting
-    const existing = await coll.findOne({ phone: lead.phone }, { projection: { _id: 1 } })
-    if (existing) {
-      console.log(`[dedup] phone ${lead.phone} already exists — skipping CRM forward`)
+    const recent = await coll.findOne(
+      { phone: lead.phone, createdAt: { $gte: TEN_MINUTES_AGO } },
+      { projection: { _id: 1 } }
+    )
+    if (recent) {
+      console.log(`[dedup] phone ${lead.phone} submitted within last 10 min — skipping`)
       return res.json({ ok: true })
     }
 
     await coll.insertOne(lead)
+    console.log(`[lead] saved — ${lead.name} | ${lead.phone}`)
   } catch (e) {
-    // E11000 = unique index violation (two truly simultaneous submissions of same phone)
-    if (e.code === 11000) {
-      console.log(`[dedup] race-condition duplicate for ${lead.phone} — skipping`)
-      return res.json({ ok: true })
-    }
     console.error('db_error:', e.message)
     return res.status(500).json({ ok: false, error: 'db_error' })
   }
@@ -102,14 +103,26 @@ app.get('/api/leads', async (req, res) => {
 
 function forwardToCrm(lead) {
   if (!process.env.CRM_WEBHOOK_URL) return
-  fetch(process.env.CRM_WEBHOOK_URL, {
+
+  // Build the final URL — append GOOGLE_WEBHOOK_KEY as ?google_key=... if provided
+  // This lets you store the base URL and key as separate Railway variables
+  let url = process.env.CRM_WEBHOOK_URL
+  const key = process.env.GOOGLE_WEBHOOK_KEY
+  if (key) {
+    const separator = url.includes('?') ? '&' : '?'
+    url = `${url}${separator}google_key=${encodeURIComponent(key)}`
+  }
+
+  console.log(`[crm-forward] → ${url}`)
+
+  fetch(url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       ...(process.env.CRM_WEBHOOK_TOKEN ? { authorization: `Bearer ${process.env.CRM_WEBHOOK_TOKEN}` } : {}),
     },
     body: JSON.stringify(lead),
-  }).catch(() => {})
+  }).catch((e) => console.error('[crm-forward] error:', e.message))
 }
 
 function notifyTelegram(lead) {
