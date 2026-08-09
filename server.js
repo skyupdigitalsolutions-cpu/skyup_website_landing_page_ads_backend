@@ -10,7 +10,7 @@ app.use(express.json({ limit: '32kb' }))
 
 const PORT = process.env.PORT || 3000
 const URI = process.env.MONGODB_URI
-const DB_NAME = process.env.MONGODB_DB || 'skyup'
+const DB_NAME = process.env.MONGODB_DB || new URL(URI || 'mongodb://localhost/skyup-crm').pathname.slice(1) || 'skyup-crm'
 const COLL = process.env.LEADS_COLLECTION || 'website_leads'
 const ADMIN_KEY = process.env.ADMIN_KEY || ''
 
