@@ -3,7 +3,7 @@
 
 import express from 'express'
 import cors from 'cors'
-import { MongoClient } from 'mongodb'
+import { MongoClient, ReturnDocument } from 'mongodb'
 
 const app = express()
 app.use(express.json({ limit: '32kb' }))
@@ -14,11 +14,9 @@ const DB_NAME = process.env.MONGODB_DB || 'skyup'
 const COLL = process.env.LEADS_COLLECTION || 'website_leads'
 const ADMIN_KEY = process.env.ADMIN_KEY || ''
 
-// Allow the landing page's origin(s) to POST here. Comma-separated, or "*" for any.
 const ORIGINS = (process.env.ALLOW_ORIGIN || '*').split(',').map((s) => s.trim()).filter(Boolean)
 app.use(cors({ origin: ORIGINS.includes('*') ? true : ORIGINS, methods: ['GET', 'POST'] }))
 
-// --- Mongo (lazy connect, reused across requests) ---
 let leadsColl = null
 async function leads() {
   if (leadsColl) return leadsColl
@@ -27,6 +25,8 @@ async function leads() {
   await client.connect()
   const coll = client.db(DB_NAME).collection(COLL)
   coll.createIndex({ createdAt: -1 }).catch(() => {})
+  // Unique index on phone — atomic DB-level dedup guard
+  coll.createIndex({ phone: 1 }, { unique: true, sparse: true }).catch(() => {})
   leadsColl = coll
   console.log(`Mongo connected → ${DB_NAME}.${COLL}`)
   return leadsColl
@@ -34,14 +34,12 @@ async function leads() {
 
 const clean = (v, max = 200) => (typeof v === 'string' ? v.trim().slice(0, max) : '')
 
-// health check — Railway pings this to confirm the container is alive
 app.get('/', (req, res) => res.json({ ok: true, service: 'skyup-leads-backend' }))
 app.get('/health', (req, res) => res.json({ ok: true }))
 
-// --- Capture a lead ---
 app.post('/api/lead', async (req, res) => {
   const b = req.body || {}
-  if (clean(b.company_website)) return res.json({ ok: true }) // honeypot: silently drop bots
+  if (clean(b.company_website)) return res.json({ ok: true }) // honeypot
 
   const lead = {
     name: clean(b.name, 120),
@@ -56,26 +54,35 @@ app.post('/api/lead', async (req, res) => {
   }
   if (!lead.name || !lead.phone) return res.status(400).json({ ok: false, error: 'missing_fields' })
 
-  // Dedup window: only block re-submission of the same phone within 10 minutes.
-  // This stops double-clicks and retries without permanently blocking a real
-  // returning visitor who fills the form again months later.
-  const TEN_MINUTES_AGO = new Date(Date.now() - 10 * 60 * 1000)
-
+  let isNew = false
   try {
     const coll = await leads()
 
-    const recent = await coll.findOne(
-      { phone: lead.phone, createdAt: { $gte: TEN_MINUTES_AGO } },
-      { projection: { _id: 1 } }
+    // Atomic upsert — $setOnInsert means if phone already exists, nothing is written.
+    // includeResultMetadata gives lastErrorObject.upserted to detect new vs duplicate.
+    const result = await coll.findOneAndUpdate(
+      { phone: lead.phone },
+      { $setOnInsert: lead },
+      {
+        upsert: true,
+        returnDocument: ReturnDocument.AFTER,
+        includeResultMetadata: true,
+      }
     )
-    if (recent) {
-      console.log(`[dedup] phone ${lead.phone} submitted within last 10 min — skipping`)
+    isNew = !!result.lastErrorObject?.upserted
+    if (!isNew) {
+      console.log(`[dedup] phone ${lead.phone} already exists — skipping`)
       return res.json({ ok: true })
     }
-
-    await coll.insertOne(lead)
+    // Attach the real MongoDB _id so CRM can use it as a dedup key
+    lead._id = result.value._id
     console.log(`[lead] saved — ${lead.name} | ${lead.phone}`)
   } catch (e) {
+    // E11000 = two truly simultaneous requests — second one loses gracefully
+    if (e.code === 11000) {
+      console.log(`[dedup] race duplicate for ${lead.phone} — skipping`)
+      return res.json({ ok: true })
+    }
     console.error('db_error:', e.message)
     return res.status(500).json({ ok: false, error: 'db_error' })
   }
@@ -85,7 +92,6 @@ app.post('/api/lead', async (req, res) => {
   res.json({ ok: true })
 })
 
-// --- Protected leads export ---
 app.get('/api/leads', async (req, res) => {
   if (!ADMIN_KEY || req.query.key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' })
   const coll = await leads()
@@ -105,7 +111,6 @@ app.get('/api/leads', async (req, res) => {
 function forwardToCrm(lead) {
   if (!process.env.CRM_WEBHOOK_URL) return
 
-  // Append GOOGLE_WEBHOOK_KEY as ?google_key=... so the CRM can match the campaign config
   let url = process.env.CRM_WEBHOOK_URL
   const key = process.env.GOOGLE_WEBHOOK_KEY
   if (key) {
@@ -117,10 +122,7 @@ function forwardToCrm(lead) {
 
   fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(process.env.CRM_WEBHOOK_TOKEN ? { authorization: `Bearer ${process.env.CRM_WEBHOOK_TOKEN}` } : {}),
-    },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify(lead),
   }).catch((e) => console.error('[crm-forward] error:', e.message))
 }
@@ -143,7 +145,4 @@ function notifyTelegram(lead) {
   }).catch(() => {})
 }
 
-// Bind to 0.0.0.0 so Railway's health check can reach the container externally.
-// Without this Node.js defaults to 127.0.0.1 (localhost only) and Railway
-// sees the port as unreachable → sends SIGTERM → restart loop.
 app.listen(PORT, '0.0.0.0', () => console.log(`skyup-leads-backend running on :${PORT}`))
